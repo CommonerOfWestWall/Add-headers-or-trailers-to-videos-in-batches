@@ -1,8 +1,50 @@
 import os
+import sys
+import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-import subprocess
 import threading
+import tempfile
+
+
+def get_ffmpeg_path():
+    """获取封装在程序中的 ffmpeg 路径"""
+    if getattr(sys, 'frozen', False):  # 如果是打包后的程序
+        base_path = sys._MEIPASS
+    else:  # 如果是脚本运行
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    ffmpeg_path = os.path.join(base_path, "ffmpeg", "bin", "ffmpeg.exe")
+    if not os.path.exists(ffmpeg_path):
+        raise FileNotFoundError(f"未找到 ffmpeg: {ffmpeg_path}")
+    return ffmpeg_path
+
+
+def get_ffprobe_path():
+    """获取封装在程序中的 ffprobe 路径"""
+    if getattr(sys, 'frozen', False):  # 如果是打包后的程序
+        base_path = sys._MEIPASS
+    else:  # 如果是脚本运行
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    ffprobe_path = os.path.join(base_path, "ffmpeg", "bin", "ffprobe.exe")
+    if not os.path.exists(ffprobe_path):
+        raise FileNotFoundError(f"未找到 ffprobe: {ffprobe_path}")
+    return ffprobe_path
+
+
+def check_video_properties(video_path, target_width, target_height, target_sar):
+    """检查视频分辨率和SAR是否匹配"""
+    ffprobe_path = get_ffprobe_path()
+    ffprobe_cmd = [
+        ffprobe_path, "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,sample_aspect_ratio",
+        "-of", "default=noprint_wrappers=1", video_path
+    ]
+    result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True)
+    props = dict(line.split('=') for line in result.stdout.strip().splitlines())
+    width, height = int(props.get("width", 0)), int(props.get("height", 0))
+    sar = props.get("sample_aspect_ratio", "1")
+    return width == target_width and height == target_height and sar == target_sar
+
 
 def get_encoder(gpu_type):
     """根据选择的GPU类型返回适合的编码器"""
@@ -15,54 +57,103 @@ def get_encoder(gpu_type):
     else:
         return "libx264"
 
-def concatenate_videos(folder_path, video_type, intro_video, outro_video, output_folder, gpu_type, bitrate, resolution, frame_rate):
+
+def preprocess_video(input_video, output_video, width, height, gpu_type=None):
+    """预处理视频：调整分辨率和宽高比"""
+    ffmpeg_path = get_ffmpeg_path()
+    codec = get_encoder(gpu_type) if gpu_type else "libx264"
+
+    ffmpeg_cmd = [
+        ffmpeg_path, "-i", input_video,
+        "-vf", f"scale={width}:{height},setsar=1",
+        "-c:v", codec, "-c:a", "aac", "-y", output_video
+    ]
+    print(f"预处理命令: {ffmpeg_cmd}")
+    subprocess.run(ffmpeg_cmd, check=True)
+
+
+def process_single_video(main_video, intro_video, outro_video, output_video, video_type, width, height, codec, bitrate, frame_rate, gpu_type):
+    """为单个视频添加片头或片尾并输出"""
+    ffmpeg_path = get_ffmpeg_path()
+    temp_dir = tempfile.gettempdir()
+    temp_videos = []
+
+    if video_type in ["片头", "同时添加片头片尾"] and intro_video:
+        preprocessed_intro = os.path.join(temp_dir, f"preprocessed_intro.mp4")
+        if not check_video_properties(intro_video, width, height, "1"):
+            preprocess_video(intro_video, preprocessed_intro, width, height, gpu_type)
+        else:
+            preprocessed_intro = intro_video
+        temp_videos.append(preprocessed_intro)
+
+    preprocessed_main = os.path.join(temp_dir, f"preprocessed_main.mp4")
+    if not check_video_properties(main_video, width, height, "1"):
+        preprocess_video(main_video, preprocessed_main, width, height, gpu_type)
+    else:
+        preprocessed_main = main_video
+    temp_videos.append(preprocessed_main)
+
+    if video_type in ["片尾", "同时添加片头片尾"] and outro_video:
+        preprocessed_outro = os.path.join(temp_dir, f"preprocessed_outro.mp4")
+        if not check_video_properties(outro_video, width, height, "1"):
+            preprocess_video(outro_video, preprocessed_outro, width, height, gpu_type)
+        else:
+            preprocessed_outro = outro_video
+        temp_videos.append(preprocessed_outro)
+
+    ffmpeg_cmd = [ffmpeg_path]
+    for video in temp_videos:
+        ffmpeg_cmd.extend(["-i", video])
+
+    filter_complex = ''.join([f"[{i}:v][{i}:a]" for i in range(len(temp_videos))])
+    filter_complex += f"concat=n={len(temp_videos)}:v=1:a=1[outv][outa]"
+
+    ffmpeg_cmd.extend([
+        "-filter_complex", filter_complex,
+        "-map", "[outv]", "-map", "[outa]",
+        "-c:v", codec, "-b:v", f"{bitrate}k", "-r", str(frame_rate), "-c:a", "aac", "-strict", "-2",
+        "-y", output_video
+    ])
+
+    print(f"执行 ffmpeg 命令: {' '.join(ffmpeg_cmd)}")
+    subprocess.run(ffmpeg_cmd, check=True)
+    print(f"已生成最终视频: {output_video}")
+
+    for video in temp_videos:
+        if video.startswith(temp_dir) and os.path.exists(video):
+            os.remove(video)
+            print(f"已删除临时文件: {video}")
+
+
+def batch_process(folder_path, video_type, intro_video, outro_video, output_folder, gpu_type, bitrate, resolution, frame_rate, orientation):
     codec = get_encoder(gpu_type)
-    scale = "1920:-2" if resolution == "1080p" else "1280:-2"
+
+    if resolution == "1080p":
+        width, height = 1920, 1080
+    elif resolution == "720p":
+        width, height = 1280, 720
+    elif resolution == "4k":
+        width, height = 3840, 2160
+    else:
+        width, height = 1920, 1080
+
+    if orientation == "竖屏":
+        width, height = height, width
 
     for filename in os.listdir(folder_path):
         if filename.endswith(('.mp4', '.mkv', '.avi')):
             main_video = os.path.join(folder_path, filename)
-            output_video = os.path.join(output_folder, f"processed_{filename}")
+            output_video = os.path.join(output_folder, f"output_{filename}")
+            process_single_video(
+                main_video, intro_video, outro_video, output_video,
+                video_type, width, height, codec, bitrate, frame_rate, gpu_type
+            )
 
-            ffmpeg_cmd = ["ffmpeg"]
-            input_streams = []
-
-            # 添加片头视频（如果需要）
-            if video_type in ["片头", "同时添加片头片尾"]:
-                ffmpeg_cmd.extend(["-i", intro_video])
-                input_streams.append(len(input_streams))
-
-            # 添加主视频
-            ffmpeg_cmd.extend(["-i", main_video])
-            input_streams.append(len(input_streams))
-
-            # 添加片尾视频（如果需要）
-            if video_type in ["片尾", "同时添加片头片尾"]:
-                ffmpeg_cmd.extend(["-i", outro_video])
-                input_streams.append(len(input_streams))
-
-            # 构建 filter_complex 字符串
-            video_filters = ';'.join([f"[{i}:v]scale={scale},setdar=16/9[v{i}]" for i in input_streams])
-            audio_filters = ';'.join([f"[{i}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a{i}]" for i in input_streams])
-            concat_filter = f"{video_filters};{audio_filters};{''.join([f'[v{i}][a{i}]' for i in input_streams])}concat=n={len(input_streams)}:v=1:a=1[outv][outa]"
-
-            # 添加 filter_complex 到 ffmpeg 命令
-            ffmpeg_cmd.extend(["-filter_complex", concat_filter])
-
-            # 设置映射和编码选项
-            ffmpeg_cmd.extend(["-map", "[outv]", "-map", "[outa]", "-c:v", codec, "-b:v", bitrate + "k", "-c:a", "aac", "-strict", "-2", output_video])
-
-            # 运行 FFmpeg 命令
-            try:
-                subprocess.run(ffmpeg_cmd, check=True)
-                print(f"已处理: {filename}")  # 或者使用其他方式更新状态
-            except subprocess.CalledProcessError as e:
-                print(f"处理失败: {filename}")  # 错误处理
 
 def update_status(message):
-    # 调用此函数来更新状态标签
     status_label.config(text=message)
-    app.update_idletasks()  # 确保UI更新
+    app.update_idletasks()
+
 
 def start_processing():
     folder_path = folder_path_var.get()
@@ -73,8 +164,8 @@ def start_processing():
     bitrate = bitrate_var.get()
     resolution = resolution_var.get()
     frame_rate = frame_rate_var.get()
+    orientation = orientation_var.get()
     output_folder = output_folder_var.get()
-    start_button.config(state="disabled")
 
     if not all([folder_path, output_folder, bitrate, resolution, frame_rate]):
         messagebox.showerror("错误", "请确保所有必要选项都已填写")
@@ -83,20 +174,23 @@ def start_processing():
     start_button.config(state="disabled")
 
     def processing_thread():
-        for filename in os.listdir(folder_path):
-             update_status(f"正在处理: {filename}")
-        concatenate_videos(folder_path, video_type, intro_video, outro_video, output_folder, gpu_type, bitrate, resolution, frame_rate)
-        
-        app.after(0, lambda: update_status("处理完成"))
-        update_status("所有视频处理完成")
-        start_button.config(state="normal")  # 重新激活开始按钮
+        try:
+            batch_process(folder_path, video_type, intro_video, outro_video, output_folder, gpu_type, bitrate, resolution, frame_rate, orientation)
+            update_status("所有视频处理完成")
+        except Exception as e:
+            messagebox.showerror("错误", str(e))
+        finally:
+            start_button.config(state="normal")
+
     thread = threading.Thread(target=processing_thread, daemon=True)
     thread.start()
+
 
 def browse_folder(var):
     folder = filedialog.askdirectory()
     if folder:
         var.set(folder)
+
 
 def browse_file(var):
     filetypes = [('视频文件', '*.mp4 *.mkv *.avi'), ('所有文件', '*.*')]
@@ -104,9 +198,10 @@ def browse_file(var):
     if filename:
         var.set(filename)
 
+
 # 创建图形界面
 app = tk.Tk()
-app.title("视频处理器")
+app.title("视频批量处理器")
 
 # 定义变量
 folder_path_var = tk.StringVar()
@@ -116,8 +211,9 @@ outro_video_var = tk.StringVar()
 gpu_type_var = tk.StringVar(value="N卡")
 bitrate_var = tk.StringVar()
 resolution_var = tk.StringVar(value="1080p")
-frame_rate_var = tk.StringVar(value="25")
+frame_rate_var = tk.StringVar()
 output_folder_var = tk.StringVar()
+orientation_var = tk.StringVar(value="横屏")
 
 # 文件夹选择框架
 folder_frame = tk.Frame(app)
@@ -133,6 +229,13 @@ tk.Label(video_type_frame, text="选择类型：").pack(side=tk.LEFT)
 tk.Radiobutton(video_type_frame, text="片头", variable=video_type_var, value="片头").pack(side=tk.LEFT)
 tk.Radiobutton(video_type_frame, text="片尾", variable=video_type_var, value="片尾").pack(side=tk.LEFT)
 tk.Radiobutton(video_type_frame, text="同时添加片头片尾", variable=video_type_var, value="同时添加片头片尾").pack(side=tk.LEFT)
+
+# 屏幕方向选择框架
+orientation_frame = tk.Frame(app)
+orientation_frame.pack(padx=10, pady=5)
+tk.Label(orientation_frame, text="选择屏幕方向：").pack(side=tk.LEFT)
+tk.Radiobutton(orientation_frame, text="横屏", variable=orientation_var, value="横屏").pack(side=tk.LEFT)
+tk.Radiobutton(orientation_frame, text="竖屏", variable=orientation_var, value="竖屏").pack(side=tk.LEFT)
 
 # 片头视频文件选择框架
 intro_video_frame = tk.Frame(app)
@@ -168,18 +271,16 @@ bitrate_var.set("1100")
 resolution_frame = tk.Frame(app)
 resolution_frame.pack(padx=10, pady=5)
 tk.Label(resolution_frame, text="选择分辨率：").pack(side=tk.LEFT)
-resolution_options = ["1080p", "720p"]
+resolution_options = ["1080p", "720p", "4k"]
 resolution_menu = ttk.Combobox(resolution_frame, textvariable=resolution_var, values=resolution_options, state="readonly")
 resolution_menu.pack(side=tk.LEFT)
 resolution_menu.set(resolution_options[0])  # 设置默认选项
 
 frame_rate_frame = tk.Frame(app)
 frame_rate_frame.pack(padx=10, pady=5)
-tk.Label(frame_rate_frame, text="选择帧率：").pack(side=tk.LEFT)
-frame_rate_options = ["25", "30"]
-frame_rate_menu = ttk.Combobox(frame_rate_frame, textvariable=frame_rate_var, values=frame_rate_options, state="readonly")
-frame_rate_menu.pack(side=tk.LEFT)
-frame_rate_menu.set(frame_rate_options[0])  
+tk.Label(frame_rate_frame, text="设置帧率：").pack(side=tk.LEFT)
+tk.Entry(frame_rate_frame, textvariable=frame_rate_var, width=10).pack(side=tk.LEFT)
+frame_rate_var.set("25")
 
 # 选择输出文件夹
 output_folder_frame = tk.Frame(app)
