@@ -1,300 +1,495 @@
 import os
-import sys
-import subprocess
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import ttk, filedialog, messagebox
 import threading
+import queue
+import subprocess
 import tempfile
+import logging
 
+class UltimateVideoProcessor:
+    def __init__(self, master):
+        self.master = master
+        self.master.title("专业视频处理工具 v4.1")
+        self.master.geometry("1366x900")
+        
+        # 初始化变量
+        self.file_list = []
+        self.processing_thread = None
+        self.stop_event = threading.Event()
+        self.log_queue = queue.Queue()
+        self.status_update_queue = queue.Queue()
+        
+        # 创建界面
+        self.create_widgets()
+        self.setup_styles()
+        
+        # 启动队列处理
+        self.master.after(100, self.process_queues)
 
-def get_ffmpeg_path():
-    """获取封装在程序中的 ffmpeg 路径"""
-    if getattr(sys, 'frozen', False):  # 如果是打包后的程序
-        base_path = sys._MEIPASS
-    else:  # 如果是脚本运行
-        base_path = os.path.dirname(os.path.abspath(__file__))
-    ffmpeg_path = os.path.join(base_path, "ffmpeg", "bin", "ffmpeg.exe")
-    if not os.path.exists(ffmpeg_path):
-        raise FileNotFoundError(f"未找到 ffmpeg: {ffmpeg_path}")
-    return ffmpeg_path
+    def setup_styles(self):
+        style = ttk.Style()
+        style.theme_use('clam')
+        
+        style.configure("TButton", padding=6, font=('微软雅黑', 10))
+        style.configure("Title.TLabel", font=('微软雅黑', 12, 'bold'))
+        style.configure("Success.TLabel", foreground='#28a745')
+        style.configure("Error.TLabel", foreground='#dc3545')
+        style.configure("Processing.TLabel", foreground='#17a2b8')
+        style.map("Red.TButton", background=[('active', '#c82333')])
 
+    def create_widgets(self):
+        # 主布局容器
+        main_frame = ttk.Frame(self.master)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-def get_ffprobe_path():
-    """获取封装在程序中的 ffprobe 路径"""
-    if getattr(sys, 'frozen', False):  # 如果是打包后的程序
-        base_path = sys._MEIPASS
-    else:  # 如果是脚本运行
-        base_path = os.path.dirname(os.path.abspath(__file__))
-    ffprobe_path = os.path.join(base_path, "ffmpeg", "bin", "ffprobe.exe")
-    if not os.path.exists(ffprobe_path):
-        raise FileNotFoundError(f"未找到 ffprobe: {ffprobe_path}")
-    return ffprobe_path
+        # 左侧控制面板
+        control_panel = ttk.Frame(main_frame, width=480)
+        control_panel.pack(side=tk.LEFT, fill=tk.BOTH, padx=5)
 
+        # 文件列表管理
+        self.create_file_list_section(control_panel)
+        
+        # 处理参数设置
+        self.create_processing_settings(control_panel)
+        self.create_advanced_settings(control_panel)
 
-def check_video_properties(video_path, target_width, target_height, target_sar):
-    """检查视频分辨率和SAR是否匹配"""
-    ffprobe_path = get_ffprobe_path()
-    ffprobe_cmd = [
-        ffprobe_path, "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,sample_aspect_ratio",
-        "-of", "default=noprint_wrappers=1", video_path
-    ]
-    result = subprocess.run(ffprobe_cmd, capture_output=True, text=True, check=True)
-    props = dict(line.split('=') for line in result.stdout.strip().splitlines())
-    width, height = int(props.get("width", 0)), int(props.get("height", 0))
-    sar = props.get("sample_aspect_ratio", "1")
-    return width == target_width and height == target_height and sar == target_sar
+        # 右侧日志面板
+        log_panel = ttk.Frame(main_frame)
+        log_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=5)
 
+        # 日志输出
+        self.create_log_section(log_panel)
 
-def get_encoder(gpu_type):
-    """根据选择的GPU类型返回适合的编码器"""
-    if gpu_type == "N卡":
-        return "h264_nvenc"
-    elif gpu_type == "A卡":
-        return "h264_amf"
-    elif gpu_type == "I卡":
-        return "h264_qsv"
-    else:
-        return "libx264"
+        # 控制按钮（位于左侧底部）
+        self.create_control_buttons(control_panel)
 
+    def create_file_list_section(self, parent):
+        """创建文件列表管理区域"""
+        frame = ttk.LabelFrame(parent, text="文件管理")
+        frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
-def preprocess_video(input_video, output_video, width, height, gpu_type=None):
-    """预处理视频：调整分辨率和宽高比"""
-    ffmpeg_path = get_ffmpeg_path()
-    codec = get_encoder(gpu_type) if gpu_type else "libx264"
+        # 操作按钮
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Button(btn_frame, text="添加文件夹", 
+                  command=self.add_folder).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="添加文件", 
+                  command=self.add_files).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="清空列表", style='Red.TButton',
+                  command=self.clear_list).pack(side=tk.RIGHT, padx=2)
 
-    ffmpeg_cmd = [
-        ffmpeg_path, "-i", input_video,
-        "-vf", f"scale={width}:{height},setsar=1",
-        "-c:v", codec, "-c:a", "aac", "-y", output_video
-    ]
-    print(f"预处理命令: {ffmpeg_cmd}")
-    subprocess.run(ffmpeg_cmd, check=True)
+        # 文件列表（含状态列）
+        self.tree = ttk.Treeview(frame, columns=('status', 'file'), show='headings', 
+                                selectmode='extended', height=15)
+        self.tree.heading('status', text='状态', anchor=tk.CENTER)
+        self.tree.heading('file', text='文件路径')
+        self.tree.column('status', width=80, anchor=tk.CENTER)
+        self.tree.column('file', width=400)
+        
+        # 滚动条
+        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
+        # 右键菜单
+        self.context_menu = tk.Menu(self.tree, tearoff=0)
+        self.context_menu.add_command(label="删除选中", command=self.delete_selected)
+        self.tree.bind("<Button-3>", self.show_context_menu)
 
-def process_single_video(main_video, intro_video, outro_video, output_video, video_type, width, height, codec, bitrate, frame_rate, gpu_type):
-    """为单个视频添加片头或片尾并输出"""
-    ffmpeg_path = get_ffmpeg_path()
-    temp_dir = tempfile.gettempdir()
-    temp_videos = []
+    def create_processing_settings(self, parent):
+        """创建处理参数设置区域"""
+        frame = ttk.LabelFrame(parent, text="处理设置")
+        frame.pack(fill=tk.X, pady=5)
 
-    if video_type in ["片头", "同时添加片头片尾"] and intro_video:
-        preprocessed_intro = os.path.join(temp_dir, f"preprocessed_intro.mp4")
-        if not check_video_properties(intro_video, width, height, "1"):
-            preprocess_video(intro_video, preprocessed_intro, width, height, gpu_type)
+        # 处理类型
+        ttk.Label(frame, text="处理类型：").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.process_type = ttk.Combobox(frame, values=["加片头", "加片尾", "同时添加"], state="readonly")
+        self.process_type.current(0)
+        self.process_type.grid(row=0, column=1, sticky=tk.EW, padx=5)
+
+        # 片头文件
+        ttk.Label(frame, text="片头文件：").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.intro_entry = ttk.Entry(frame)
+        self.intro_entry.grid(row=1, column=1, sticky=tk.EW, padx=5)
+        ttk.Button(frame, text="浏览", command=lambda: self.browse_file(self.intro_entry)).grid(row=1, column=2)
+
+        # 片尾文件
+        ttk.Label(frame, text="片尾文件：").grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.outro_entry = ttk.Entry(frame)
+        self.outro_entry.grid(row=2, column=1, sticky=tk.EW, padx=5)
+        ttk.Button(frame, text="浏览", command=lambda: self.browse_file(self.outro_entry)).grid(row=2, column=2)
+
+        # 输出目录
+        ttk.Label(frame, text="输出目录：").grid(row=3, column=0, sticky=tk.W, pady=2)
+        self.output_entry = ttk.Entry(frame)
+        self.output_entry.grid(row=3, column=1, sticky=tk.EW, padx=5)
+        ttk.Button(frame, text="浏览", command=self.browse_output_dir).grid(row=3, column=2)
+
+        frame.columnconfigure(1, weight=1)
+
+    def create_advanced_settings(self, parent):
+        """创建高级编码设置区域"""
+        frame = ttk.LabelFrame(parent, text="编码设置")
+        frame.pack(fill=tk.X, pady=5)
+
+        # 硬件加速
+        ttk.Label(frame, text="硬件加速：").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.hardware_accel = ttk.Combobox(frame, 
+                                         values=["NVIDIA GPU", "AMD GPU", "Intel GPU", "CPU"],
+                                         state="readonly")
+        self.hardware_accel.current(0)
+        self.hardware_accel.grid(row=0, column=1, sticky=tk.EW, padx=5)
+
+        # 分辨率
+        ttk.Label(frame, text="分辨率：").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.resolution = ttk.Combobox(frame, values=["1920x1080", "1280x720", "3840x2160"])
+        self.resolution.current(0)
+        self.resolution.grid(row=1, column=1, sticky=tk.EW, padx=5)
+
+        # 帧率
+        ttk.Label(frame, text="帧率 (fps)：").grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.framerate = ttk.Spinbox(frame, from_=1, to=60, increment=1)
+        self.framerate.set("30")
+        self.framerate.grid(row=2, column=1, sticky=tk.EW, padx=5)
+
+        # 码率
+        ttk.Label(frame, text="码率 (kbps)：").grid(row=3, column=0, sticky=tk.W, pady=2)
+        self.bitrate = ttk.Spinbox(frame, from_=1000, to=50000, increment=500)
+        self.bitrate.set("5000")
+        self.bitrate.grid(row=3, column=1, sticky=tk.EW, padx=5)
+
+        frame.columnconfigure(1, weight=1)
+
+    def create_log_section(self, parent):
+        """创建日志区域"""
+        # 日志输出
+        self.log_text = tk.Text(parent, wrap=tk.WORD, state=tk.DISABLED,
+                              font=('Consolas', 10), bg='#f8f9fa', height=20)
+        scrollbar = ttk.Scrollbar(parent, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+        
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+        # 进度条
+        self.progress = ttk.Progressbar(parent, orient=tk.HORIZONTAL, mode='determinate')
+        self.progress.pack(fill=tk.X, pady=5)
+
+    def create_control_buttons(self, parent):
+        """创建控制按钮（位于左侧底部）"""
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=10)
+        
+        self.start_btn = ttk.Button(btn_frame, text="开始处理", command=self.start_processing)
+        self.start_btn.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+        
+        self.stop_btn = ttk.Button(btn_frame, text="停止处理", style='Red.TButton',
+                                  command=self.stop_processing, state=tk.DISABLED)
+        self.stop_btn.pack(side=tk.LEFT, padx=5, expand=True, fill=tk.X)
+
+    def browse_file(self, entry_widget):
+        """选择文件"""
+        path = filedialog.askopenfilename(filetypes=[("视频文件", "*.mp4 *.mkv *.avi *.mov")])
+        if path:
+            entry_widget.delete(0, tk.END)
+            entry_widget.insert(0, path)
+
+    def browse_output_dir(self):
+        """选择输出目录"""
+        path = filedialog.askdirectory()
+        if path:
+            self.output_entry.delete(0, tk.END)
+            self.output_entry.insert(0, path)
+
+    def show_context_menu(self, event):
+        """显示右键菜单"""
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+
+    def add_folder(self):
+        """添加文件夹及其子文件夹中的视频文件"""
+        folder = filedialog.askdirectory()
+        if folder:
+            new_files = []
+            for root, _, files in os.walk(folder):
+                for file in files:
+                    if file.lower().endswith(('.mp4', '.mkv', '.avi', '.mov')):
+                        full_path = os.path.join(root, file)
+                        if full_path not in self.file_list:
+                            new_files.append(full_path)
+            self.update_file_list(new_files)
+
+    def add_files(self):
+        """添加单个或多个文件"""
+        files = filedialog.askopenfilenames(
+            filetypes=[("视频文件", "*.mp4 *.mkv *.avi *.mov")]
+        )
+        self.update_file_list(files)
+
+    def delete_selected(self):
+        """删除选中的文件"""
+        selected = self.tree.selection()
+        for item in selected:
+            file_path = self.tree.item(item)['values'][1]
+            self.file_list.remove(file_path)
+            self.tree.delete(item)
+        self.log(f"已删除 {len(selected)} 个文件")
+
+    def clear_list(self):
+        """清空文件列表"""
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.file_list.clear()
+        self.log("已清空文件列表")
+
+    def update_file_list(self, new_files):
+        """更新文件列表并去重"""
+        existing = set(self.file_list)
+        added = [f for f in new_files if f not in existing]
+        
+        for f in added:
+            self.file_list.append(f)
+            self.tree.insert('', tk.END, values=('等待处理', f))
+        
+        if added:
+            self.log(f"成功添加 {len(added)} 个文件")
         else:
-            preprocessed_intro = intro_video
-        temp_videos.append(preprocessed_intro)
+            self.log("没有新增文件")
 
-    preprocessed_main = os.path.join(temp_dir, f"preprocessed_main.mp4")
-    if not check_video_properties(main_video, width, height, "1"):
-        preprocess_video(main_video, preprocessed_main, width, height, gpu_type)
-    else:
-        preprocessed_main = main_video
-    temp_videos.append(preprocessed_main)
+    def start_processing(self):
+        """开始处理"""
+        if not self.validate_inputs():
+            return
+        
+        self.start_btn.config(state=tk.DISABLED)
+        self.stop_btn.config(state=tk.NORMAL)
+        self.progress['value'] = 0
+        self.stop_event.clear()
+        
+        self.processing_thread = threading.Thread(target=self.process_files, daemon=True)
+        self.processing_thread.start()
 
-    if video_type in ["片尾", "同时添加片头片尾"] and outro_video:
-        preprocessed_outro = os.path.join(temp_dir, f"preprocessed_outro.mp4")
-        if not check_video_properties(outro_video, width, height, "1"):
-            preprocess_video(outro_video, preprocessed_outro, width, height, gpu_type)
-        else:
-            preprocessed_outro = outro_video
-        temp_videos.append(preprocessed_outro)
+    def validate_inputs(self):
+        """验证输入有效性"""
+        if not self.output_entry.get():
+            messagebox.showerror("错误", "请选择输出目录")
+            return False
+        
+        if not self.file_list:
+            messagebox.showerror("错误", "请先添加要处理的文件")
+            return False
+        
+        process_type = self.process_type.get()
+        if process_type in ["加片头", "同时添加"] and not self.intro_entry.get():
+            messagebox.showerror("错误", "请选择片头文件")
+            return False
+        
+        if process_type in ["加片尾", "同时添加"] and not self.outro_entry.get():
+            messagebox.showerror("错误", "请选择片尾文件")
+            return False
+        
+        return True
 
-    ffmpeg_cmd = [ffmpeg_path]
-    for video in temp_videos:
-        ffmpeg_cmd.extend(["-i", video])
-
-    filter_complex = ''.join([f"[{i}:v][{i}:a]" for i in range(len(temp_videos))])
-    filter_complex += f"concat=n={len(temp_videos)}:v=1:a=1[outv][outa]"
-
-    ffmpeg_cmd.extend([
-        "-filter_complex", filter_complex,
-        "-map", "[outv]", "-map", "[outa]",
-        "-c:v", codec, "-b:v", f"{bitrate}k", "-r", str(frame_rate), "-c:a", "aac", "-strict", "-2",
-        "-y", output_video
-    ])
-
-    print(f"执行 ffmpeg 命令: {' '.join(ffmpeg_cmd)}")
-    subprocess.run(ffmpeg_cmd, check=True)
-    print(f"已生成最终视频: {output_video}")
-
-    for video in temp_videos:
-        if video.startswith(temp_dir) and os.path.exists(video):
-            os.remove(video)
-            print(f"已删除临时文件: {video}")
-
-
-def batch_process(folder_path, video_type, intro_video, outro_video, output_folder, gpu_type, bitrate, resolution, frame_rate, orientation):
-    codec = get_encoder(gpu_type)
-
-    if resolution == "1080p":
-        width, height = 1920, 1080
-    elif resolution == "720p":
-        width, height = 1280, 720
-    elif resolution == "4k":
-        width, height = 3840, 2160
-    else:
-        width, height = 1920, 1080
-
-    if orientation == "竖屏":
-        width, height = height, width
-
-    for filename in os.listdir(folder_path):
-        if filename.endswith(('.mp4', '.mkv', '.avi')):
-            main_video = os.path.join(folder_path, filename)
-            output_video = os.path.join(output_folder, f"output_{filename}")
-            process_single_video(
-                main_video, intro_video, outro_video, output_video,
-                video_type, width, height, codec, bitrate, frame_rate, gpu_type
-            )
-
-
-def update_status(message):
-    status_label.config(text=message)
-    app.update_idletasks()
-
-
-def start_processing():
-    folder_path = folder_path_var.get()
-    video_type = video_type_var.get()
-    intro_video = intro_video_var.get()
-    outro_video = outro_video_var.get()
-    gpu_type = gpu_type_var.get()
-    bitrate = bitrate_var.get()
-    resolution = resolution_var.get()
-    frame_rate = frame_rate_var.get()
-    orientation = orientation_var.get()
-    output_folder = output_folder_var.get()
-
-    if not all([folder_path, output_folder, bitrate, resolution, frame_rate]):
-        messagebox.showerror("错误", "请确保所有必要选项都已填写")
-        return
-
-    start_button.config(state="disabled")
-
-    def processing_thread():
+    def process_files(self):
+        """处理文件主逻辑"""
         try:
-            batch_process(folder_path, video_type, intro_video, outro_video, output_folder, gpu_type, bitrate, resolution, frame_rate, orientation)
-            update_status("所有视频处理完成")
+            total = len(self.file_list)
+            output_dir = self.output_entry.get()
+            
+            for idx, file_path in enumerate(self.file_list):
+                if self.stop_event.is_set():
+                    break
+                
+                item_id = self.get_item_id(file_path)
+                self.update_status(item_id, "处理中", "processing")
+                
+                try:
+                    output_path = os.path.join(output_dir, f"processed_{os.path.basename(file_path)}")
+                    self.process_single_file(file_path, output_path)
+                    self.update_status(item_id, "成功", "success")
+                except Exception as e:
+                    self.log(f"文件处理失败：{file_path} - {str(e)}", "error")
+                    self.update_status(item_id, "失败", "error")
+                    continue
+                
+                # 更新进度
+                progress = (idx + 1) / total * 100
+                self.progress['value'] = progress
+            
+            if not self.stop_event.is_set():
+                self.log("所有文件处理完成！", "success")
+                
         except Exception as e:
-            messagebox.showerror("错误", str(e))
+            self.log(f"处理失败: {str(e)}", "error")
         finally:
-            start_button.config(state="normal")
+            self.start_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
 
-    thread = threading.Thread(target=processing_thread, daemon=True)
-    thread.start()
+    def process_single_file(self, input_path, output_path):
+        """单个文件处理"""
+        temp_dir = tempfile.mkdtemp()
+        try:
+            encoder = self.get_encoder()
+            resolution = self.resolution.get()
+            framerate = self.framerate.get()
+            bitrate = f"{self.bitrate.get()}k"
+            
+            segments = []
+            if self.process_type.get() in ["加片头", "同时添加"]:
+                intro_temp = os.path.join(temp_dir, "intro.mp4")
+                self.preprocess_video(self.intro_entry.get(), intro_temp, encoder, resolution, framerate)
+                segments.append(intro_temp)
+            
+            main_temp = os.path.join(temp_dir, "main.mp4")
+            self.preprocess_video(input_path, main_temp, encoder, resolution, framerate)
+            segments.append(main_temp)
+            
+            if self.process_type.get() in ["加片尾", "同时添加"]:
+                outro_temp = os.path.join(temp_dir, "outro.mp4")
+                self.preprocess_video(self.outro_entry.get(), outro_temp, encoder, resolution, framerate)
+                segments.append(outro_temp)
+            
+            self.concat_videos(segments, output_path, encoder, bitrate, framerate)
+            
+        except Exception as e:
+            raise e
+        finally:
+            # 清理临时文件
+            for f in segments:
+                try:
+                    os.remove(f)
+                except:
+                    pass
+            try:
+                os.rmdir(temp_dir)
+            except:
+                pass
 
+    def preprocess_video(self, input_path, output_path, encoder, resolution, framerate):
+        """预处理视频"""
+        cmd = [
+            'ffmpeg',
+            '-hide_banner',
+            '-i', input_path,
+            '-vf', f'scale={resolution},fps={framerate}',
+            '-c:v', encoder,
+            '-y', output_path
+        ]
+        self.run_command(cmd)
 
-def browse_folder(var):
-    folder = filedialog.askdirectory()
-    if folder:
-        var.set(folder)
+    def concat_videos(self, input_files, output_path, encoder, bitrate, framerate):
+        """拼接视频"""
+        list_file = os.path.join(tempfile.gettempdir(), "filelist.txt")
+        with open(list_file, 'w', encoding='utf-8') as f:
+            for file in input_files:
+                f.write(f"file '{file}'\n")
+        
+        cmd = [
+            'ffmpeg',
+            '-hide_banner',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', list_file,
+            '-c:v', encoder,
+            '-b:v', bitrate,
+            '-r', framerate,
+            '-y', output_path
+        ]
+        self.run_command(cmd)
+        os.remove(list_file)
 
+    def get_encoder(self):
+        """获取选择的编码器"""
+        hardware = self.hardware_accel.get()
+        return {
+            "NVIDIA GPU": "h264_nvenc",
+            "AMD GPU": "h264_amf",
+            "Intel GPU": "h264_qsv",
+            "CPU": "libx264"
+        }[hardware]
 
-def browse_file(var):
-    filetypes = [('视频文件', '*.mp4 *.mkv *.avi'), ('所有文件', '*.*')]
-    filename = filedialog.askopenfilename(filetypes=filetypes)
-    if filename:
-        var.set(filename)
+    def run_command(self, cmd):
+        """执行命令行并处理输出"""
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                encoding='utf-8',
+                errors='replace'
+            )
+            
+            for line in process.stdout:
+                self.log(line.strip(), "debug")
+            
+            if process.wait() != 0:
+                raise subprocess.CalledProcessError(process.returncode, cmd)
+                
+        except UnicodeDecodeError as ude:
+            self.log(f"编码错误：{str(ude)}", "warning")
+        except Exception as e:
+            raise e
 
+    def update_status(self, item_id, status, tag):
+        """更新文件状态"""
+        self.status_update_queue.put((item_id, status, tag))
 
-# 创建图形界面
-app = tk.Tk()
-app.title("视频批量处理器")
+    def get_item_id(self, file_path):
+        """通过文件路径获取Treeview的item id"""
+        for child in self.tree.get_children():
+            if self.tree.item(child)['values'][1] == file_path:
+                return child
+        return None
 
-# 定义变量
-folder_path_var = tk.StringVar()
-video_type_var = tk.StringVar(value="片尾")
-intro_video_var = tk.StringVar()
-outro_video_var = tk.StringVar()
-gpu_type_var = tk.StringVar(value="N卡")
-bitrate_var = tk.StringVar()
-resolution_var = tk.StringVar(value="1080p")
-frame_rate_var = tk.StringVar()
-output_folder_var = tk.StringVar()
-orientation_var = tk.StringVar(value="横屏")
+    def process_queues(self):
+        """处理所有队列"""
+        # 处理日志队列
+        while not self.log_queue.empty():
+            msg, tag = self.log_queue.get()
+            self.log_text.configure(state=tk.NORMAL)
+            self.log_text.insert(tk.END, msg + "\n", tag)
+            self.log_text.tag_config(tag, foreground=self.get_log_color(tag))
+            self.log_text.configure(state=tk.DISABLED)
+            self.log_text.see(tk.END)
+        
+        # 处理状态更新队列
+        while not self.status_update_queue.empty():
+            item_id, status, tag = self.status_update_queue.get()
+            self.tree.item(item_id, values=(status, self.tree.item(item_id)['values'][1]))
+            self.tree.tag_configure(tag, foreground=self.get_log_color(tag))
+        
+        self.master.after(100, self.process_queues)
 
-# 文件夹选择框架
-folder_frame = tk.Frame(app)
-folder_frame.pack(padx=10, pady=5)
-tk.Label(folder_frame, text="选择视频文件夹：").pack(side=tk.LEFT)
-tk.Entry(folder_frame, textvariable=folder_path_var, width=50).pack(side=tk.LEFT)
-tk.Button(folder_frame, text="浏览", command=lambda: browse_folder(folder_path_var)).pack(side=tk.LEFT)
+    def get_log_color(self, tag):
+        """获取日志颜色"""
+        colors = {
+            "info": "#2c3e50",
+            "success": "#28a745",
+            "warning": "#ffc107",
+            "error": "#dc3545",
+            "processing": "#17a2b8",
+            "debug": "#6c757d"
+        }
+        return colors.get(tag, "#2c3e50")
 
-# 视频类型选择框架
-video_type_frame = tk.Frame(app)
-video_type_frame.pack(padx=10, pady=5)
-tk.Label(video_type_frame, text="选择类型：").pack(side=tk.LEFT)
-tk.Radiobutton(video_type_frame, text="片头", variable=video_type_var, value="片头").pack(side=tk.LEFT)
-tk.Radiobutton(video_type_frame, text="片尾", variable=video_type_var, value="片尾").pack(side=tk.LEFT)
-tk.Radiobutton(video_type_frame, text="同时添加片头片尾", variable=video_type_var, value="同时添加片头片尾").pack(side=tk.LEFT)
+    def stop_processing(self):
+        """停止处理"""
+        if messagebox.askyesno("确认", "确定要停止当前处理任务吗？"):
+            self.stop_event.set()
+            self.log("处理已中止", "warning")
+            self.stop_btn.config(state=tk.DISABLED)
 
-# 屏幕方向选择框架
-orientation_frame = tk.Frame(app)
-orientation_frame.pack(padx=10, pady=5)
-tk.Label(orientation_frame, text="选择屏幕方向：").pack(side=tk.LEFT)
-tk.Radiobutton(orientation_frame, text="横屏", variable=orientation_var, value="横屏").pack(side=tk.LEFT)
-tk.Radiobutton(orientation_frame, text="竖屏", variable=orientation_var, value="竖屏").pack(side=tk.LEFT)
+    def log(self, message, tag="info"):
+        """记录日志"""
+        self.log_queue.put((message, tag))
 
-# 片头视频文件选择框架
-intro_video_frame = tk.Frame(app)
-intro_video_frame.pack(padx=10, pady=5)
-tk.Label(intro_video_frame, text="选择片头视频文件：").pack(side=tk.LEFT)
-tk.Entry(intro_video_frame, textvariable=intro_video_var, width=50).pack(side=tk.LEFT)
-tk.Button(intro_video_frame, text="浏览", command=lambda: browse_file(intro_video_var)).pack(side=tk.LEFT)
-
-# 片尾视频文件选择框架
-outro_video_frame = tk.Frame(app)
-outro_video_frame.pack(padx=10, pady=5)
-tk.Label(outro_video_frame, text="选择片尾视频文件：").pack(side=tk.LEFT)
-tk.Entry(outro_video_frame, textvariable=outro_video_var, width=50).pack(side=tk.LEFT)
-tk.Button(outro_video_frame, text="浏览", command=lambda: browse_file(outro_video_var)).pack(side=tk.LEFT)
-
-# 显卡类型选择框架
-gpu_type_frame = tk.Frame(app)
-gpu_type_frame.pack(padx=10, pady=5)
-tk.Label(gpu_type_frame, text="选择显卡类型：").pack(side=tk.LEFT)
-gpu_options = ["N卡", "A卡", "I卡", "集成核显"]
-gpu_menu = ttk.Combobox(gpu_type_frame, textvariable=gpu_type_var, values=gpu_options, state="readonly")
-gpu_menu.pack(side=tk.LEFT)
-gpu_menu.set(gpu_options[0])  # 设置默认选项
-
-# 码率设置框架
-bitrate_frame = tk.Frame(app)
-bitrate_frame.pack(padx=10, pady=5)
-tk.Label(bitrate_frame, text="设置码率 (kbps)：").pack(side=tk.LEFT)
-tk.Entry(bitrate_frame, textvariable=bitrate_var, width=10).pack(side=tk.LEFT)
-bitrate_var.set("1100")
-
-# 分辨率和帧率选择框架
-resolution_frame = tk.Frame(app)
-resolution_frame.pack(padx=10, pady=5)
-tk.Label(resolution_frame, text="选择分辨率：").pack(side=tk.LEFT)
-resolution_options = ["1080p", "720p", "4k"]
-resolution_menu = ttk.Combobox(resolution_frame, textvariable=resolution_var, values=resolution_options, state="readonly")
-resolution_menu.pack(side=tk.LEFT)
-resolution_menu.set(resolution_options[0])  # 设置默认选项
-
-frame_rate_frame = tk.Frame(app)
-frame_rate_frame.pack(padx=10, pady=5)
-tk.Label(frame_rate_frame, text="设置帧率：").pack(side=tk.LEFT)
-tk.Entry(frame_rate_frame, textvariable=frame_rate_var, width=10).pack(side=tk.LEFT)
-frame_rate_var.set("25")
-
-# 选择输出文件夹
-output_folder_frame = tk.Frame(app)
-output_folder_frame.pack(padx=10, pady=5)
-tk.Label(output_folder_frame, text="选择输出文件夹：").pack(side=tk.LEFT)
-tk.Entry(output_folder_frame, textvariable=output_folder_var, width=50).pack(side=tk.LEFT)
-tk.Button(output_folder_frame, text="浏览", command=lambda: browse_folder(output_folder_var)).pack(side=tk.LEFT)
-
-# 开始按钮
-start_button = tk.Button(app, text="开始处理", bg="red", fg="white", font=("Arial", 12, "bold"), command=start_processing)
-start_button.pack(pady=20)
-
-# 状态标签
-status_label = tk.Label(app, text="等待开始...")
-status_label.pack(pady=5)
-
-app.mainloop()
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = UltimateVideoProcessor(root)
+    root.mainloop()
