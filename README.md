@@ -22,8 +22,8 @@
 
 1. 克隆本仓库或下载源代码
    ```bash
-   git clone https://github.com/yourusername/video-processor.git
-   cd video-processor
+[   git clone https://github.com/yourusername/video-processor.git
+   cd video-processor](https://github.com/CommonerOfWestWall/Add-headers-or-trailers-to-videos-in-batches.git)
    ```
 
 2. 安装依赖
