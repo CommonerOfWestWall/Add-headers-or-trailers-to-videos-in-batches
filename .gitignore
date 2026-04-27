@@ -1,0 +1,29 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+*.egg-info/
+*.egg
+build/           # ignore default pyinstaller build output
+!build/          # but keep the build/ directory itself
+!build/*.spec     # so we can track .spec files
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# FFmpeg binaries (user-placed, not committed)
+ffmpeg.exe
+ffprobe.exe
