@@ -1,0 +1,3 @@
+# Tell Git to treat these as binary files
+*.exe binary
+*.dll binary
