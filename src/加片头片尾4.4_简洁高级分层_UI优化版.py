@@ -27,33 +27,13 @@ import threading
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 
 VIDEO_EXTENSIONS = (".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".m4v")
-
-
-def _find_ffmpeg_binary(name: str) -> str | None:
-    """
-    查找 ffmpeg / ffprobe 可执行文件。
-    优先级：
-      1. exe 同级目录下的 {name}.exe   ← 用户直接把 ffmpeg.exe/ffprobe.exe 丢进来
-      2. 系统 PATH（shutil.which）      ← 兜底，方便开发者本机调试
-    """
-    # frozen=True 说明已打包为 exe；此时 sys.executable 就是 exe 本体路径。
-    # 脚本直接运行时用 __file__ 所在目录（方便调试）。
-    if getattr(sys, "frozen", False):
-        base_dir = Path(sys.executable).parent
-    else:
-        base_dir = Path(__file__).parent
-
-    local = base_dir / f"{name}.exe"
-    if local.is_file():
-        return str(local)
-
-    return shutil.which(name)
 
 
 @dataclass
@@ -67,6 +47,254 @@ class EncodePlan:
     crf_cq: str
     audio_bitrate: str
     extra_args: str
+
+
+@dataclass
+class ErrorDiagnosis:
+    category: str
+    severity: str
+    chinese_title: str
+    chinese_reason: str
+    chinese_solution: str
+    original_lines: List[str]
+
+
+class FFmpegErrorAnalyzer:
+    """把 FFmpeg stderr 和退出码翻译成用户能看懂的中文。"""
+
+    PATTERNS: List[Tuple[str, str, str, str, str, str]] = [
+        (
+            r"Unknown encoder\s+'([^']+)'|Encoder\s+(\w+)\s+not found|"
+            r"Codec\s+(\w+)\s+not found|unknown encoder|Invalid argument.*codec|Unsupported codec",
+            "codec", "error", "编码器不支持",
+            "FFmpeg 不支持请求的编码器。可能您的 FFmpeg 版本较旧，或编译时未启用该编码器。",
+            "1) 运行 `ffmpeg -encoders` 查看支持的编码器；\n"
+            "2) 前往 https://ffmpeg.org/download.html 下载最新版 FFmpeg；\n"
+            "3) 尝试更换编码格式（H.264 兼容更好）或硬件加速选项（CPU / NVIDIA / AMD / Intel）。"
+        ),
+        (
+            r"No NVENC capable devices|Cannot load nvEncodeAPI|NVENC Error|"
+            r"Failed to initialize.*encoder|h264_nvenc.*not supported|hevc_nvenc.*not supported|"
+            r"Cannot init CUDA|CUDA_ERROR|nvenc",
+            "hwaccel", "error", "显卡硬件编码失败",
+            "NVIDIA NVENC 硬件编码器无法初始化。可能是显卡不支持、驱动过旧，或 FFmpeg 未编译 NVENC 支持。",
+            "1) 更新显卡驱动到最新版（建议从 NVIDIA 官网下载）；\n"
+            "2) 在“硬件加速”中选择“CPU”，改用软件编码 libx264 / libx265；\n"
+            "3) 确认显卡支持 NVENC（较老的 GTX 或笔记本核显可能不支持）；\n"
+            "4) 笔记本请检查是否启用了独立显卡。"
+        ),
+        (
+            r"No such file or directory|Invalid data found when processing input|"
+            r"Failed to open input|Error opening input",
+            "file", "error", "输入文件不存在或损坏",
+            "FFmpeg 无法打开输入文件。文件可能已被移动、删除，或路径含有特殊字符。",
+            "1) 检查文件是否仍在原位置；\n"
+            "2) 避免路径中出现 #、%、& 等特殊字符；\n"
+            "3) 若路径含中文，确保 FFmpeg 使用 UTF-8；\n"
+            "4) 尝试把文件复制到纯英文路径（如 D:\\test\\video.mp4）后再处理。"
+        ),
+        (
+            r"Permission denied.*output|Permission denied.*write|Could not write header|Failed to open output",
+            "permission", "error", "输出目录无写入权限",
+            "FFmpeg 无法在输出目录写入文件。可能目录被其他程序占用，或没有写入权限。",
+            "1) 检查输出目录是否被播放器、资源管理器等占用，关闭后重试；\n"
+            "2) 更换输出目录，如桌面或文档文件夹；\n"
+            "3) 以管理员身份运行本程序；\n"
+            "4) 检查杀毒软件是否拦截了写入。"
+        ),
+        (
+            r"Error configuring filter|Error initializing filter|Invalid filtergraph|Bad filtergraph|Syntax error in filtergraph|"
+            r"No such filter|Failed to configure output|Filter.*has an unconnected output|"
+            r"Invalid argument.*filter|Cannot find a matching stream",
+            "filter", "error", "滤镜参数错误",
+            "FFmpeg 滤镜链语法有误。可能是分辨率、帧率、画面适配等参数格式错误，或滤镜名称拼写错误。",
+            "1) 检查分辨率格式是否正确（如 1080x1920）；\n"
+            "2) 宽高必须是偶数；\n"
+            "3) 尝试把“画面适配”改为“居中裁剪”或“完整保留补黑边”；\n"
+            "4) 高级参数不要乱填，清空后重试。"
+        ),
+        (
+            r"Unsupported pixel format|pixel format.*not supported|Incompatible pixel format|"
+            r"Conversion from .* not supported",
+            "format", "error", "像素格式不支持",
+            "视频的像素格式不被当前编码器支持。",
+            "1) 在“高级参数”里加上 -pix_fmt yuv420p；\n"
+            "2) 若源视频是 10-bit/HDR，可先转换为 8-bit 或更换编码器。"
+        ),
+        (
+            r"No space left on device|Disk full|insufficient disk space|Write error",
+            "disk", "error", "磁盘空间不足",
+            "输出磁盘已满，FFmpeg 无法继续写入。",
+            "1) 清理输出磁盘空间；\n"
+            "2) 更换输出目录到有足够空间的磁盘；\n"
+            "3) 降低码率或分辨率以减小文件体积。"
+        ),
+        (
+            r"Cannot allocate memory|out of memory|Allocation failed|malloc failed",
+            "memory", "error", "内存/显存不足",
+            "FFmpeg 无法分配足够的内存或显存。4K/HDR/HEVC 视频处理或硬件编码时容易出现。",
+            "1) 关闭其他占用内存/显存的程序；\n"
+            "2) 降低输出分辨率或码率；\n"
+            "3) 改用 CPU 编码并一次只处理一个文件；\n"
+            "4) 增加物理内存或虚拟内存。"
+        ),
+        (
+            r"hevc.*error|h\.265.*error|Invalid data found when processing input|corrupt input|"
+            r"Failed to decode.*hevc|Failed to decode.*h265|Error parsing.*hevc",
+            "codec", "error", "HEVC/H.265 解码失败",
+            "FFmpeg 无法解码 HEVC/H.265 视频。文件可能损坏，或缺少 HEVC 解码器。",
+            "1) 用 VLC 播放器打开视频确认未损坏；\n"
+            "2) 更新 FFmpeg 到最新版；\n"
+            "3) 安装 HEVC 视频扩展（Windows 商店）或换用支持 HEVC 的 FFmpeg 版本；\n"
+            "4) 尝试先用 FFmpeg 转封装：ffmpeg -i input.mkv -c:v libx264 -crf 23 temp.mp4"
+        ),
+        (
+            r"Unknown decoder|Decoder not found|Failed to decode|corrupt input",
+            "codec", "error", "解码失败",
+            "FFmpeg 无法解码输入视频。视频文件可能损坏，或使用了不常见的编码格式。",
+            "1) 用 VLC 播放器打开视频确认未损坏；\n"
+            "2) 更新 FFmpeg 到最新版；\n"
+            "3) 尝试先用 FFmpeg 转码一次：ffmpeg -i input.mp4 -c:v libx264 -crf 23 temp.mp4"
+        ),
+        (
+            r"Packet mismatch|Invalid audio stream|audio.*corrupt|ac3.*error|aac.*error",
+            "audio", "error", "音频流异常",
+            "视频音频流损坏或格式不被支持，导致 FFmpeg 无法处理。",
+            "1) 在“音频模式”中选择“静音输出”跳过音频；\n"
+            "2) 或选择“AAC 立体声”重新编码音频；\n"
+            "3) 尝试先用 FFmpeg 提取/重编码音频。"
+        ),
+        (
+            r"concat.*error|Unsafe file name|Protocol not found",
+            "concat", "error", "拼接失败",
+            "多段视频拼接失败。可能是文件路径含有特殊字符，或拼接列表格式错误。",
+            "1) 避免路径中出现单引号、空格、特殊字符；\n"
+            "2) 检查片头、片尾和主视频是否都是有效的 MP4 文件；\n"
+            "3) 把视频复制到纯英文路径后重试。"
+        ),
+    ]
+
+    EXIT_CODES: dict[int, Tuple[str, str, str, str, str]] = {
+        # 0xC0000005 STATUS_ACCESS_VIOLATION
+        3221225781: (
+            "crash", "error", "FFmpeg 进程崩溃",
+            "FFmpeg 异常退出（内存访问冲突）。常见于 4K/HDR/HEVC 解码或 NVENC/AMF 硬件编码时驱动/内存不稳定，也可能是输入文件损坏导致解码器崩溃。",
+            "1) 在“硬件加速”中选择“CPU”，关闭硬件加速；\n"
+            "2) 更新显卡驱动到最新版；\n"
+            "3) 降低分辨率、码率，或关闭其他占用显存的程序；\n"
+            "4) 尝试用 VLC 等播放器确认视频文件未损坏；\n"
+            "5) 换一个 FFmpeg 版本重试。"
+        ),
+        # 0xC00000FD STATUS_STACK_OVERFLOW
+        3221225725: (
+            "crash", "error", "FFmpeg 堆栈溢出",
+            "FFmpeg 出现堆栈溢出。可能是滤镜链过于复杂或输入文件异常。",
+            "1) 降低分辨率或简化画面适配选项；\n"
+            "2) 检查输入文件是否损坏；\n"
+            "3) 换一个 FFmpeg 版本重试。"
+        ),
+        # 0xC0000022 STATUS_ACCESS_DENIED
+        3221225506: (
+            "permission", "error", "FFmpeg 被系统拒绝",
+            "FFmpeg 进程被系统拒绝执行。可能是权限不足或杀毒软件拦截。",
+            "1) 以管理员身份运行本程序；\n"
+            "2) 把程序目录加入杀毒软件白名单；\n"
+            "3) 检查 ffmpeg.exe 是否被其他程序锁定。"
+        ),
+        # 0xFFFFFFD8 = -40，常见于硬件编码器初始化失败
+        4294967256: (
+            "hwaccel", "error", "编码器初始化失败",
+            "FFmpeg 返回 -40（功能未实现/初始化失败），通常是请求的硬件编码器（如 h264_nvenc）无法初始化。",
+            "1) 确认显卡支持并启用 NVENC；\n"
+            "2) 更新显卡驱动；\n"
+            "3) 在“硬件加速”中选择“CPU”；\n"
+            "4) 笔记本请检查是否使用独立显卡。"
+        ),
+        # 0xFFFFFFFE = -2，常见于文件未找到或初始化失败
+        4294967294: (
+            "file", "error", "FFmpeg 初始化失败",
+            "FFmpeg 进程初始化失败（返回 -2），通常是输入文件不存在、命令参数错误，或依赖 DLL 缺失。",
+            "1) 检查输入文件是否存在；\n"
+            "2) 确认 ffmpeg.exe 与所有依赖 DLL 完整；\n"
+            "3) 尝试在命令行手动运行相同命令排查。"
+        ),
+    }
+
+    @classmethod
+    def analyze(cls, stderr_lines: List[str], exit_code: Optional[int] = None) -> List[ErrorDiagnosis]:
+        diagnoses: List[ErrorDiagnosis] = []
+        used_indices: set = set()
+
+        if exit_code is not None and exit_code != 0:
+            if exit_code in cls.EXIT_CODES:
+                category, severity, title, reason, solution = cls.EXIT_CODES[exit_code]
+                diagnoses.append(ErrorDiagnosis(
+                    category=category,
+                    severity=severity,
+                    chinese_title=title,
+                    chinese_reason=reason,
+                    chinese_solution=solution,
+                    original_lines=[f"退出码：{exit_code}"]
+                ))
+            else:
+                diagnoses.append(ErrorDiagnosis(
+                    category="exit_code",
+                    severity="error",
+                    chinese_title="FFmpeg 异常退出",
+                    chinese_reason=f"FFmpeg 返回了非零退出码 {exit_code}。",
+                    chinese_solution="1) 查看下方原始日志；\n"
+                                     "2) 尝试降低分辨率、码率或改用 CPU 编码后重试；\n"
+                                     "3) 将退出码和日志复制到搜索引擎查找解决方案。",
+                    original_lines=[f"退出码：{exit_code}"]
+                ))
+
+        for pattern, category, severity, title, reason, solution in cls.PATTERNS:
+            regex = re.compile(pattern, re.IGNORECASE)
+            for i, line in enumerate(stderr_lines):
+                if i in used_indices:
+                    continue
+                m = regex.search(line)
+                if m:
+                    diagnoses.append(ErrorDiagnosis(
+                        category=category,
+                        severity=severity,
+                        chinese_title=title,
+                        chinese_reason=reason,
+                        chinese_solution=solution,
+                        original_lines=[line]
+                    ))
+                    used_indices.add(i)
+                    break
+
+        if not diagnoses and stderr_lines:
+            diagnoses.append(ErrorDiagnosis(
+                category="unknown",
+                severity="error",
+                chinese_title="未知错误",
+                chinese_reason="FFmpeg 返回了错误，但无法识别具体原因。",
+                chinese_solution="1) 尝试降低分辨率、码率或改用 CPU 编码后重试；\n"
+                                 "2) 确认 FFmpeg 版本较新（建议 5.0+）；\n"
+                                 "3) 将完整日志复制到搜索引擎查找解决方案。",
+                original_lines=stderr_lines[-6:]
+            ))
+        return diagnoses
+
+    @classmethod
+    def format_diagnosis(cls, stderr_lines: List[str], exit_code: Optional[int] = None) -> str:
+        """把诊断结果格式化成可以直接显示给用户的字符串。"""
+        diagnoses = cls.analyze(stderr_lines, exit_code)
+        lines = []
+        for d in diagnoses:
+            lines.append(f"[错误分析] {d.chinese_title}")
+            lines.append(f"  原因：{d.chinese_reason}")
+            lines.append("  解决：")
+            for sol_line in d.chinese_solution.split("\n"):
+                lines.append(f"    {sol_line}")
+        if (not diagnoses or all(d.category in ("unknown", "exit_code") for d in diagnoses)) and stderr_lines:
+            lines.append("原始日志最后几行：")
+            for line in stderr_lines[-6:]:
+                lines.append(f"  {line}")
+        return "\n".join(lines)
 
 
 class ScrollableFrame(ttk.Frame):
@@ -127,8 +355,8 @@ class VideoProcessorApp:
         self.ui_queue = queue.Queue()
         self.current_process = None
 
-        self.ffmpeg_path = _find_ffmpeg_binary("ffmpeg")
-        self.ffprobe_path = _find_ffmpeg_binary("ffprobe")
+        self.ffmpeg_path = shutil.which("ffmpeg")
+        self.ffprobe_path = shutil.which("ffprobe")
 
         self._build_variables()
         self._setup_styles()
@@ -1151,6 +1379,7 @@ class VideoProcessorApp:
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             creationflags = subprocess.CREATE_NO_WINDOW
+        output_lines: List[str] = []
         try:
             self.current_process = subprocess.Popen(
                 cmd,
@@ -1168,11 +1397,13 @@ class VideoProcessorApp:
                     raise RuntimeError("用户已停止任务")
                 line = line.strip()
                 if line:
+                    output_lines.append(line)
                     self.log(line, "debug")
             ret = self.current_process.wait()
             self.current_process = None
             if ret != 0:
-                raise subprocess.CalledProcessError(ret, cmd)
+                diagnosis = FFmpegErrorAnalyzer.format_diagnosis(output_lines, exit_code=ret)
+                raise RuntimeError(f"FFmpeg 处理失败（退出码 {ret}）\n{diagnosis}")
         except Exception:
             self._terminate_current_process()
             raise
@@ -1215,20 +1446,10 @@ class VideoProcessorApp:
         return f'"{s}"' if " " in s else s
 
     def _show_ffmpeg_warning(self):
-        self.log("未检测到 ffmpeg.exe。请将 ffmpeg.exe 和 ffprobe.exe 放到本软件 exe 所在目录。", "error")
+        self.log("未检测到 ffmpeg。请安装 ffmpeg 并加入系统 PATH。", "error")
         messagebox.showwarning(
             "缺少 FFmpeg",
-            "没有检测到 FFmpeg。\n\n"
-            "操作步骤：\n"
-            "  1. 前往 https://ffmpeg.org/download.html 下载 FFmpeg Windows 版\n"
-            "  2. 解压后，将 ffmpeg.exe 和 ffprobe.exe\n"
-            "     复制到本软件 exe 所在目录\n\n"
-            "  目录示例：\n"
-            "    视频片头片尾批处理工具.exe\n"
-            "    ffmpeg.exe       ← 放这里\n"
-            "    ffprobe.exe      ← 放这里\n\n"
-            "放好后重新打开软件即可。\n\n"
-            "（也支持将 ffmpeg 加入系统 PATH，效果相同）",
+            "没有检测到 ffmpeg。\n\n请先安装 FFmpeg，并把 ffmpeg.exe 所在目录加入系统 PATH。\n安装后重新打开本软件。",
         )
 
     # ------------------------------------------------------------------
